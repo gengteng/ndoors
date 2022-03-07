@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::error::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -112,16 +113,16 @@ impl Settings {
 /// 挑战者抉择
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 pub enum Decision {
-    /// 坚持之前的选择
-    Stick,
-
     /// 改变选择
     Switch,
+
+    /// 坚持选择
+    Stick,
 }
 
 impl Default for Decision {
     fn default() -> Self {
-        Self::Stick
+        Self::Switch
     }
 }
 
@@ -301,7 +302,7 @@ impl Room {
     }
 
     /// 主持人揭示（提供留下的门序号即可）
-    pub fn reveal_random(&mut self) -> Result<()> {
+    pub fn reveal_random(&mut self) -> Result<u32> {
         match &mut self.state {
             RoomState::Started { stage, prize, .. } => {
                 if let Stage::Reveal { chosen } = stage {
@@ -315,7 +316,7 @@ impl Room {
                         chosen: *chosen,
                         left,
                     };
-                    Ok(())
+                    Ok(left)
                 } else {
                     Err(Error::InvalidOperation)
                 }
