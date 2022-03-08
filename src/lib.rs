@@ -1,8 +1,12 @@
-#![allow(dead_code)]
-use crate::error::*;
+mod error;
+
+pub use error::*;
+use rand::distributions::Standard;
+use rand::prelude::Distribution;
+pub use uuid::Uuid;
+
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// 房间状态
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,6 +139,16 @@ impl Default for Decision {
     }
 }
 
+impl Distribution<Decision> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Decision {
+        if 0 > rng.next_u32() as i32 {
+            Decision::Switch
+        } else {
+            Decision::Stick
+        }
+    }
+}
+
 /// 游戏房间
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Room {
@@ -142,7 +156,9 @@ pub struct Room {
     id: Uuid,
     /// 主持人 ID
     host: Uuid,
+    /// 游戏设置
     settings: Settings,
+    /// 房间状态
     state: RoomState,
 }
 
@@ -155,6 +171,26 @@ impl Room {
             settings,
             state: RoomState::default(),
         }
+    }
+
+    /// 房间 ID
+    pub fn id(&self) -> &Uuid {
+        &self.id
+    }
+
+    /// 主持人 ID
+    pub fn host(&self) -> &Uuid {
+        &self.host
+    }
+
+    /// 当前游戏配置
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// 当前房间状态
+    pub fn state(&self) -> &RoomState {
+        &self.state
     }
 
     /// 接收挑战者
@@ -179,11 +215,6 @@ impl Room {
             }
             _ => Err(Error::InvalidOperation),
         }
-    }
-
-    /// 当前游戏配置
-    pub fn settings(&self) -> Settings {
-        self.settings
     }
 
     /// 更新设置，返回 `true` 表示需要通知挑战者重新选择就绪
@@ -386,6 +417,7 @@ impl Room {
         }
     }
 
+    /// 完成本局游戏并输出每局结果
     pub fn complete(&mut self, kick_contestant: bool) -> Result<Vec<RoundResult>> {
         let new_state = match &mut self.state {
             RoomState::Started {
@@ -410,6 +442,116 @@ impl Room {
             RoomState::Started { results, .. } => Ok(results),
             _ => return Err(Error::Impossible),
         }
+    }
+}
+
+/// 一局游戏结果
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GameResult {
+    /// 游戏设置
+    settings: Settings,
+    /// 赢的轮数
+    win: u32,
+    /// 选择时就选了正确选项
+    chosen_win: u32,
+    /// 主持人留下的是正确选项
+    left_win: u32,
+    /// 改变选择的次数
+    switch: u32,
+    /// 坚持选择的次数
+    stick: u32,
+    /// 改变选择后赢的次数
+    switch_win: u32,
+    /// 坚持选择后赢的次数
+    stick_win: u32,
+}
+
+impl GameResult {
+    pub fn calculate<R>(doors: u32, results: R) -> Self
+    where
+        R: AsRef<[RoundResult]>,
+    {
+        let results = results.as_ref();
+        let settings = Settings::new(doors, results.len() as u32);
+        let mut game_result = GameResult {
+            settings,
+            win: 0,
+            chosen_win: 0,
+            left_win: 0,
+            switch: 0,
+            stick: 0,
+            switch_win: 0,
+            stick_win: 0,
+        };
+
+        for result in results {
+            if result.chosen == result.prize {
+                game_result.chosen_win += 1;
+            }
+
+            if result.left == result.prize {
+                game_result.left_win += 1;
+            }
+
+            match result.decision {
+                Decision::Switch => {
+                    game_result.switch += 1;
+                    if result.win {
+                        game_result.win += 1;
+                        game_result.switch_win += 1;
+                    }
+                }
+                Decision::Stick => {
+                    game_result.stick += 1;
+                    if result.win {
+                        game_result.win += 1;
+                        game_result.stick_win += 1;
+                    }
+                }
+            }
+        }
+
+        game_result
+    }
+
+    /// 游戏设置
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// 赢的轮数
+    pub fn win(&self) -> u32 {
+        self.win
+    }
+
+    /// 选择时就选了正确选项
+    pub fn chosen_win(&self) -> u32 {
+        self.chosen_win
+    }
+
+    /// 主持人留下的是正确选项
+    pub fn left_win(&self) -> u32 {
+        self.left_win
+    }
+
+    /// 改变选择的次数
+    pub fn switch(&self) -> u32 {
+        self.switch
+    }
+
+    /// 坚持选择的次数
+    pub fn stick(&self) -> u32 {
+        self.stick
+    }
+
+    /// 改变选择后赢的次数
+    pub fn switch_win(&self) -> u32 {
+        self.switch_win
+    }
+
+    /// 坚持选择后赢的次数
+    pub fn stick_win(&self) -> u32 {
+        self.stick_win
     }
 }
 

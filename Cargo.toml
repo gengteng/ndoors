@@ -10,3 +10,11 @@ thiserror = "1.0"
 rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.0.0-alpha.1", features = ["v4", "serde"] }
+
+[[bin]]
+name = "ndoors"
+path = "src/cli.rs"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
