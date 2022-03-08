@@ -1,4 +1,6 @@
-#[derive(Debug, thiserror::Error)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
 pub enum Error {
     #[error("Invalid operation")]
     InvalidOperation,
