@@ -2,7 +2,7 @@ use ndoors::*;
 
 fn main() -> Result<()> {
     let doors = 3;
-    let rounds = 10000;
+    let rounds = 100000;
 
     // 生成主持人
     let host = Uuid::new_v4();
@@ -34,9 +34,10 @@ fn main() -> Result<()> {
         room.decide(rand::random())?;
     }
 
-    // 获得本局游戏的结果
+    // 完成本局游戏并获得每一轮的结果
     let results = room.complete(false)?;
 
+    // 统计游戏结果
     let result = GameResult::calculate(settings.doors, results);
     let settings = result.settings();
     println!(

@@ -225,10 +225,13 @@ impl Room {
                 Ok(false)
             }
             RoomState::Joined { ready, .. } => {
-                let notify_contestant = *ready;
-                self.settings = settings;
+                // 如果配置没有改变，不需要做任何事
+                let notify_contestant = self.settings != settings;
                 // 如果挑战者已经就绪，需要重置，让挑战者重新选择就绪
-                *ready = false;
+                if notify_contestant {
+                    self.settings = settings;
+                    *ready = false;
+                }
                 Ok(notify_contestant)
             }
             RoomState::Started { .. } => Err(Error::InvalidOperation),
