@@ -81,10 +81,7 @@ impl Default for Stage {
 
 impl Stage {
     pub fn is_end(&self) -> bool {
-        match self {
-            Stage::End { .. } => true,
-            _ => false,
-        }
+        matches!(self, Stage::End { .. })
     }
 }
 
@@ -397,10 +394,7 @@ impl Room {
         {
             let result = match stage {
                 Stage::Decide { chosen, left } => {
-                    let win_the_prize = match (*chosen, *left, decision) {
-                        (p, _, Decision::Stick) | (_, p, Decision::Switch) if p == *prize => true,
-                        _ => false,
-                    };
+                    let win_the_prize = matches!((*chosen, *left, decision), (p, _, Decision::Stick) | (_, p, Decision::Switch) if p == *prize);
                     RoundResult {
                         prize: *prize,
                         chosen: *chosen,
@@ -443,7 +437,7 @@ impl Room {
 
         match std::mem::replace(&mut self.state, new_state) {
             RoomState::Started { results, .. } => Ok(results),
-            _ => return Err(Error::Impossible),
+            _ => Err(Error::Impossible),
         }
     }
 }

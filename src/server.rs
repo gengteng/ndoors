@@ -76,128 +76,124 @@ async fn handle_ws(mut socket: WebSocket, server: Server) -> anyhow::Result<()> 
     let mut user = User::default();
 
     // 监听 socket 以及 room 中其他成员广播的消息
-    loop {
-        if let Some(result) = socket.recv().await.transpose()? {
-            match result {
-                Message::Text(request) => {
-                    let request: GameRequest = serde_json::from_str(&request)?;
-                    match (request, &mut user) {
-                        (GameRequest::ListRooms { page, size }, _) => {
-                            let total = server.rooms.len() as u32;
-                            let rooms = server
-                                .rooms
-                                .iter()
-                                .skip((page * size) as usize)
-                                .map(|room| (room.0.id().clone(), room.0.settings()))
-                                .collect();
-                            let response = GameResponse::RoomList {
-                                rooms,
-                                page,
-                                size,
-                                total,
-                            };
-                            socket
-                                .send(Message::Text(serde_json::to_string(&response)?))
-                                .await?;
-                        }
-                        (GameRequest::EnterRoom { id }, user) => {
-                            let response = match user.role {
-                                Role::Guest => match server.rooms.get_mut(&id) {
-                                    None => GameResponse::ServerError {
-                                        cause: ServerError::RoomNotFound { id },
-                                    },
-                                    Some(mut room) => {
-                                        room.0.accept_contestant(user.id)?;
-                                        user.role = Role::Contestant {
-                                            sender: room.1.clone(),
-                                        };
-                                        GameResponse::RoomEntered
-                                    }
+    while let Some(result) = socket.recv().await.transpose()? {
+        match result {
+            Message::Text(request) => {
+                let request: GameRequest = serde_json::from_str(&request)?;
+                match (request, &mut user) {
+                    (GameRequest::ListRooms { page, size }, _) => {
+                        let total = server.rooms.len() as u32;
+                        let rooms = server
+                            .rooms
+                            .iter()
+                            .skip((page * size) as usize)
+                            .map(|room| (*room.0.id(), room.0.settings()))
+                            .collect();
+                        let response = GameResponse::RoomList {
+                            rooms,
+                            page,
+                            size,
+                            total,
+                        };
+                        socket
+                            .send(Message::Text(serde_json::to_string(&response)?))
+                            .await?;
+                    }
+                    (GameRequest::EnterRoom { id }, user) => {
+                        let response = match user.role {
+                            Role::Guest => match server.rooms.get_mut(&id) {
+                                None => GameResponse::ServerError {
+                                    cause: ServerError::RoomNotFound { id },
                                 },
-                                _ => GameResponse::GameError {
-                                    cause: Error::InvalidOperation,
-                                },
-                            };
-                            // TODO: 广播给主持人
-                            socket
-                                .send(Message::Text(serde_json::to_string(&response)?))
-                                .await?;
-                        }
-                        (GameRequest::CreateRoom { settings }, user) => {
-                            let response = match user.role {
-                                Role::Guest => {
-                                    let settings = match settings {
-                                        None => server.default_settings,
-                                        Some(settings) => settings,
+                                Some(mut room) => {
+                                    room.0.accept_contestant(user.id)?;
+                                    user.role = Role::Contestant {
+                                        sender: room.1.clone(),
                                     };
-
-                                    let room = Room::create(user.id, settings);
-                                    let room_id = room.id().clone();
-                                    let (sender, receiver) = channel(16);
-                                    server.rooms.insert(room_id, (room, sender.clone()));
-                                    let s = server.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = room_loop(room_id, s, receiver).await {
-                                            eprintln!("Room loop error: {e}");
-                                        }
-                                    });
-                                    user.role = Role::Host { sender };
-                                    GameResponse::RoomCreated {
-                                        id: room_id,
-                                        settings,
-                                    }
+                                    GameResponse::RoomEntered
                                 }
-                                _ => GameResponse::GameError {
-                                    cause: Error::InvalidOperation,
-                                },
-                            };
-                            socket
-                                .send(Message::Text(serde_json::to_string(&response)?))
-                                .await?;
-                        }
-                        (request, user) => {
-                            let response = match &user.role {
-                                Role::Contestant { sender } | Role::Host { sender } => {
-                                    let (responder, rx) = oneshot::channel();
-                                    sender
-                                        .send(InternalRequest { request, responder })
-                                        .await
-                                        .map_err(send_error)?;
-                                    match rx.await? {
-                                        // 接收出错意味着房间挂了？
-                                        Ok(response) => response,
-                                        Err(cause) => GameResponse::GameError { cause },
-                                    }
-                                }
-                                _ => GameResponse::GameError {
-                                    cause: Error::InvalidOperation,
-                                },
-                            };
+                            },
+                            _ => GameResponse::GameError {
+                                cause: Error::InvalidOperation,
+                            },
+                        };
+                        // TODO: 广播给主持人
+                        socket
+                            .send(Message::Text(serde_json::to_string(&response)?))
+                            .await?;
+                    }
+                    (GameRequest::CreateRoom { settings }, user) => {
+                        let response = match user.role {
+                            Role::Guest => {
+                                let settings = match settings {
+                                    None => server.default_settings,
+                                    Some(settings) => settings,
+                                };
 
-                            // TODO: 广播给所有人，奖品索引不要发送给挑战者
-                            socket
-                                .send(Message::Text(serde_json::to_string(&response)?))
-                                .await?;
-                        }
+                                let room = Room::create(user.id, settings);
+                                let room_id = *room.id();
+                                let (sender, receiver) = channel(16);
+                                server.rooms.insert(room_id, (room, sender.clone()));
+                                let s = server.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = room_loop(room_id, s, receiver).await {
+                                        eprintln!("Room loop error: {e}");
+                                    }
+                                });
+                                user.role = Role::Host { sender };
+                                GameResponse::RoomCreated {
+                                    id: room_id,
+                                    settings,
+                                }
+                            }
+                            _ => GameResponse::GameError {
+                                cause: Error::InvalidOperation,
+                            },
+                        };
+                        socket
+                            .send(Message::Text(serde_json::to_string(&response)?))
+                            .await?;
+                    }
+                    (request, user) => {
+                        let response = match &user.role {
+                            Role::Contestant { sender } | Role::Host { sender } => {
+                                let (responder, rx) = oneshot::channel();
+                                sender
+                                    .send(InternalRequest { request, responder })
+                                    .await
+                                    .map_err(send_error)?;
+                                match rx.await? {
+                                    // 接收出错意味着房间挂了？
+                                    Ok(response) => response,
+                                    Err(cause) => GameResponse::GameError { cause },
+                                }
+                            }
+                            _ => GameResponse::GameError {
+                                cause: Error::InvalidOperation,
+                            },
+                        };
+
+                        // TODO: 广播给所有人，奖品索引不要发送给挑战者
+                        socket
+                            .send(Message::Text(serde_json::to_string(&response)?))
+                            .await?;
                     }
                 }
-                Message::Close(c) => match c {
-                    Some(c) => {
-                        println!(
-                            "Connection closed: code = {}, reason = {}",
-                            c.code, c.reason
-                        );
-                        break;
-                    }
-                    None => {
-                        println!("Connection closed without close frame",);
-                        break;
-                    }
-                },
-                _ => {}
             }
-        } else {
-            break;
+            Message::Close(c) => match c {
+                Some(c) => {
+                    println!(
+                        "Connection closed: code = {}, reason = {}",
+                        c.code, c.reason
+                    );
+                    break;
+                }
+                None => {
+                    println!("Connection closed without close frame",);
+                    break;
+                }
+            },
+            _ => {}
         }
     }
 
@@ -209,106 +205,89 @@ async fn room_loop(
     server: Server,
     mut receiver: Receiver<InternalRequest>,
 ) -> anyhow::Result<()> {
-    loop {
-        match receiver.recv().await {
-            Some(request) => {
-                let InternalRequest { request, responder } = request;
-                let room = &mut server
-                    .rooms
-                    .get_mut(&id)
-                    .ok_or_else(|| anyhow::anyhow!("Room {} closed.", id))?
-                    .0;
-                match request {
-                    GameRequest::ExitRoom { id } => {
-                        if id != *room.id() {
-                            eprintln!("exit room error: {} != {}", id, room.id())
-                        }
-                        responder
-                            .send(Ok(GameResponse::Exited))
-                            .map_err(send_error)?;
-                        break;
-                    }
-                    GameRequest::Ready { ready } => {
-                        let response = room
-                            .contestant_ready(ready)
-                            .map(|_| GameResponse::Ready { ready });
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::Choose { chosen } => {
-                        let response = match chosen {
-                            Index::Random => {
-                                room.choose_random().map(|chosen| GameResponse::Chosen {
-                                    chosen,
-                                    random: true,
-                                })
-                            }
-                            Index::Specified(chosen) => {
-                                room.choose(chosen).map(|_| GameResponse::Chosen {
-                                    chosen,
-                                    random: false,
-                                })
-                            }
-                        };
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::Decide { decision } => {
-                        let response = room
-                            .decide(decision)
-                            .map(|result| GameResponse::Decided { result });
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::UpdateSettings { settings } => {
-                        let response = room
-                            .update_settings(settings)
-                            .map(|notify| GameResponse::SettingsUpdated { settings, notify });
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::Start { prize } => {
-                        let response = match prize {
-                            Index::Random => {
-                                room.start_random().map(|prize| GameResponse::Started {
-                                    prize,
-                                    random: true,
-                                })
-                            }
-                            Index::Specified(prize) => {
-                                room.start(prize).map(|_| GameResponse::Started {
-                                    prize,
-                                    random: false,
-                                })
-                            }
-                        };
-
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::Reveal { left } => {
-                        let response = match left {
-                            Index::Random => room
-                                .reveal_random()
-                                .map(|left| GameResponse::Revealed { left, random: true }),
-                            Index::Specified(left) => {
-                                room.reveal(left).map(|_| GameResponse::Revealed {
-                                    left,
-                                    random: false,
-                                })
-                            }
-                        };
-
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    GameRequest::Complete { kick_contestant } => {
-                        let response = room.complete(kick_contestant).map(|results| {
-                            let result = GameResult::calculate(room.settings().doors, results);
-                            GameResponse::Completed { result }
-                        });
-                        responder.send(response).map_err(send_error)?;
-                    }
-                    _req => {}
+    while let Some(request) = receiver.recv().await {
+        let InternalRequest { request, responder } = request;
+        let room = &mut server
+            .rooms
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Room {} closed.", id))?
+            .0;
+        match request {
+            GameRequest::ExitRoom { id } => {
+                if id != *room.id() {
+                    eprintln!("exit room error: {} != {}", id, room.id())
                 }
-            }
-            None => {
+                responder
+                    .send(Ok(GameResponse::Exited))
+                    .map_err(send_error)?;
                 break;
             }
+            GameRequest::Ready { ready } => {
+                let response = room
+                    .contestant_ready(ready)
+                    .map(|_| GameResponse::Ready { ready });
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::Choose { chosen } => {
+                let response = match chosen {
+                    Index::Random => room.choose_random().map(|chosen| GameResponse::Chosen {
+                        chosen,
+                        random: true,
+                    }),
+                    Index::Specified(chosen) => room.choose(chosen).map(|_| GameResponse::Chosen {
+                        chosen,
+                        random: false,
+                    }),
+                };
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::Decide { decision } => {
+                let response = room
+                    .decide(decision)
+                    .map(|result| GameResponse::Decided { result });
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::UpdateSettings { settings } => {
+                let response = room
+                    .update_settings(settings)
+                    .map(|notify| GameResponse::SettingsUpdated { settings, notify });
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::Start { prize } => {
+                let response = match prize {
+                    Index::Random => room.start_random().map(|prize| GameResponse::Started {
+                        prize,
+                        random: true,
+                    }),
+                    Index::Specified(prize) => room.start(prize).map(|_| GameResponse::Started {
+                        prize,
+                        random: false,
+                    }),
+                };
+
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::Reveal { left } => {
+                let response = match left {
+                    Index::Random => room
+                        .reveal_random()
+                        .map(|left| GameResponse::Revealed { left, random: true }),
+                    Index::Specified(left) => room.reveal(left).map(|_| GameResponse::Revealed {
+                        left,
+                        random: false,
+                    }),
+                };
+
+                responder.send(response).map_err(send_error)?;
+            }
+            GameRequest::Complete { kick_contestant } => {
+                let response = room.complete(kick_contestant).map(|results| {
+                    let result = GameResult::calculate(room.settings().doors, results);
+                    GameResponse::Completed { result }
+                });
+                responder.send(response).map_err(send_error)?;
+            }
+            _req => {}
         }
     }
 
