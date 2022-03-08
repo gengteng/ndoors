@@ -31,7 +31,7 @@ pub enum RoomState {
         prize: u32,
 
         /// 当前已经赢的轮数
-        win: u32,
+        results: Vec<RoundResult>,
 
         /// 当前轮状态
         stage: Stage,
@@ -72,6 +72,15 @@ pub enum Stage {
 impl Default for Stage {
     fn default() -> Self {
         Self::Choose
+    }
+}
+
+impl Stage {
+    pub fn is_end(&self) -> bool {
+        match self {
+            Stage::End { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -197,34 +206,29 @@ impl Room {
 
     /// 开始游戏并将奖品随机放到一个门内
     pub fn start_random(&mut self) -> Result<u32> {
-        match self.state {
-            RoomState::Joined { ready, contestant } if ready => {
+        match &mut self.state {
+            RoomState::Joined { ready, contestant } if *ready => {
                 let prize = rand::thread_rng().gen_range(0..self.settings.doors);
                 self.state = RoomState::Started {
-                    contestant,
+                    contestant: *contestant,
                     current_round: 0,
                     prize,
-                    win: 0,
+                    results: vec![],
                     stage: Stage::Choose,
                 };
                 Ok(prize)
             }
             RoomState::Started {
-                contestant,
                 current_round,
-                win,
-                stage: Stage::End { .. },
+                stage,
+                prize,
                 ..
-            } if current_round < self.settings.rounds - 1 => {
-                let prize = rand::thread_rng().gen_range(0..self.settings.doors);
-                self.state = RoomState::Started {
-                    contestant,
-                    current_round: current_round + 1,
-                    prize,
-                    win,
-                    stage: Stage::Choose,
-                };
-                Ok(prize)
+            } if stage.is_end() && *current_round < self.settings.rounds - 1 => {
+                let new_prize = rand::thread_rng().gen_range(0..self.settings.doors);
+                *current_round += 1;
+                *stage = Stage::Choose;
+                *prize = new_prize;
+                Ok(new_prize)
             }
             _ => Err(Error::InvalidOperation),
         }
@@ -235,31 +239,26 @@ impl Room {
         if prize >= self.settings.doors {
             return Err(Error::InvalidDoorIndex);
         }
-        match self.state {
-            RoomState::Joined { ready, contestant } if ready => {
+        match &mut self.state {
+            RoomState::Joined { ready, contestant } if *ready => {
                 self.state = RoomState::Started {
-                    contestant,
+                    contestant: *contestant,
                     current_round: 0,
                     prize,
-                    win: 0,
+                    results: vec![],
                     stage: Stage::Choose,
                 };
                 Ok(())
             }
             RoomState::Started {
-                contestant,
                 current_round,
-                prize,
-                win,
-                stage: Stage::End { .. },
-            } if current_round < self.settings.rounds - 1 => {
-                self.state = RoomState::Started {
-                    contestant,
-                    current_round: current_round + 1,
-                    prize,
-                    win,
-                    stage: Stage::Choose,
-                };
+                prize: p,
+                stage,
+                ..
+            } if stage.is_end() && *current_round < self.settings.rounds - 1 => {
+                *current_round += 1;
+                *stage = Stage::Choose;
+                *p = prize;
                 Ok(())
             }
             _ => Err(Error::InvalidOperation),
@@ -356,34 +355,60 @@ impl Room {
     /// 挑战者做出最终抉择
     pub fn decide(&mut self, decision: Decision) -> Result<RoundResult> {
         if let RoomState::Started {
-            contestant,
-            current_round,
             prize,
-            win,
-            stage: Stage::Decide { chosen, left },
-        } = self.state
+            ref mut results,
+            stage,
+            ..
+        } = &mut self.state
         {
-            let win_the_prize = match (chosen, left, decision) {
-                (p, _, Decision::Stick) | (_, p, Decision::Switch) if p == prize => true,
-                _ => false,
+            let result = match stage {
+                Stage::Decide { chosen, left } => {
+                    let win_the_prize = match (*chosen, *left, decision) {
+                        (p, _, Decision::Stick) | (_, p, Decision::Switch) if p == *prize => true,
+                        _ => false,
+                    };
+                    RoundResult {
+                        prize: *prize,
+                        chosen: *chosen,
+                        left: *left,
+                        decision,
+                        win: win_the_prize,
+                    }
+                }
+                _ => return Err(Error::InvalidOperation),
             };
-            let result = RoundResult {
-                prize,
-                chosen,
-                left,
-                decision,
-                win: win_the_prize,
-            };
-            self.state = RoomState::Started {
-                contestant,
-                current_round,
-                prize,
-                win: if win_the_prize { win + 1 } else { win },
-                stage: Stage::End { result },
-            };
+
+            results.push(result);
+            *stage = Stage::End { result };
             Ok(result)
         } else {
             Err(Error::InvalidOperation)
+        }
+    }
+
+    pub fn complete(&mut self, kick_contestant: bool) -> Result<Vec<RoundResult>> {
+        let new_state = match &mut self.state {
+            RoomState::Started {
+                contestant,
+                current_round,
+                stage,
+                ..
+            } if stage.is_end() && *current_round >= self.settings.rounds - 1 => {
+                if kick_contestant {
+                    RoomState::Created
+                } else {
+                    RoomState::Joined {
+                        contestant: *contestant,
+                        ready: false,
+                    }
+                }
+            }
+            _ => return Err(Error::InvalidOperation),
+        };
+
+        match std::mem::replace(&mut self.state, new_state) {
+            RoomState::Started { results, .. } => Ok(results),
+            _ => return Err(Error::Impossible),
         }
     }
 }
