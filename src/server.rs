@@ -1,7 +1,8 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Extension, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, get_service};
 use axum::Router;
 use dashmap::DashMap;
 use ndoors::*;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tower_http::services::ServeDir;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,6 +18,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .fallback(get_service(ServeDir::new("./html")).handle_error(
+            |error: std::io::Error| async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Unhandled internal error: {}", error),
+                )
+            },
+        ))
         .layer(Extension(Server::default()));
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
