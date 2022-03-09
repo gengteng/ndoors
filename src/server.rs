@@ -41,6 +41,16 @@ async fn ws_handler(
         let (resp_sender, resp_receiver) = channel(16);
         let (req_sender, req_receiver) = channel(16);
         let user = User::new(resp_sender);
+        if user
+            .sender
+            .send(GameResponse::UserCreated { id: user.id })
+            .await
+            .is_err()
+        {
+            eprintln!("Failed to send UserCreated response");
+            return;
+        }
+
         let s = server.clone();
         tokio::spawn(async move {
             if let Err(e) = request_handler(user, s, req_receiver).await {
@@ -424,6 +434,9 @@ enum ServerError {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "resp")]
 enum GameResponse {
+    UserCreated {
+        id: Uuid,
+    },
     RoomList {
         rooms: Vec<(Uuid, Settings)>,
         page: u32,
