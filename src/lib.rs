@@ -443,7 +443,7 @@ impl Room {
 }
 
 /// 一局游戏结果
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 pub struct GameResult {
     /// 游戏设置
     settings: Settings,

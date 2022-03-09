@@ -45,25 +45,25 @@ fn main() -> Result<()> {
         settings.doors, settings.rounds
     );
     println!(
-        "共赢得奖品 {} 轮，未赢得奖品 {} 轮，胜率 {:.2}%；",
+        "共中奖 {} 轮，未中奖 {} 轮，中奖率 {:.2}%；",
         result.win(),
         settings.rounds - result.win(),
         result.win() as f64 * 100.0 / settings.rounds as f64
     );
     println!(
-        "第一次就选择正确 {} 轮，第一次未选择正确 {} 轮，第一次选择正确率 {:.2}%；",
+        "第一次就选中奖品 {} 轮，第一次未选中奖品 {} 轮，第一次选中奖品概率 {:.2}%；",
         result.chosen_win(),
         settings.rounds - result.chosen_win(),
         result.chosen_win() as f64 * 100.0 / settings.rounds as f64
     );
     println!(
-        "坚持选择 {} 轮，坚持后赢得奖品 {} 轮，坚持选择正确率 {:.2}%；",
+        "坚持选择 {} 轮，坚持后中奖 {} 轮，坚持选择中奖率 {:.2}%；",
         result.stick(),
         result.stick_win(),
         result.stick_win() as f64 * 100.0 / result.stick() as f64
     );
     println!(
-        "改变选择 {} 轮，改变后赢得奖品 {} 轮，改变选择正确率 {:.2}%。",
+        "改变选择 {} 轮，改变后中奖 {} 轮，改变选择中奖率 {:.2}%。",
         result.switch(),
         result.switch_win(),
         result.switch_win() as f64 * 100.0 / result.switch() as f64
