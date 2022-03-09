@@ -203,6 +203,19 @@ impl Room {
         }
     }
 
+    /// 踢出挑战者
+    pub fn kick_contestant(&mut self) -> Result<()> {
+        if matches!(
+            self.state,
+            RoomState::Joined { .. } | RoomState::Started { .. }
+        ) {
+            self.state = RoomState::Created;
+            Ok(())
+        } else {
+            Err(Error::InvalidOperation)
+        }
+    }
+
     /// 挑战者就绪
     pub fn contestant_ready(&mut self, ready: bool) -> Result<()> {
         match &mut self.state {

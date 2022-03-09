@@ -11,9 +11,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+use tracing::Level;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout.with_max_level(Level::INFO)),
+        )
+        .init();
+
     let addr = SocketAddr::new([0, 0, 0, 0].into(), 7654);
 
     let app = Router::new()
@@ -26,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             },
         ))
+        .layer(TraceLayer::new_for_http())
         .layer(Extension(Server::default()));
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -47,18 +60,20 @@ async fn ws_handler(
             .await
             .is_err()
         {
-            eprintln!("Failed to send UserCreated response");
+            tracing::error!("Failed to send UserCreated response");
             return;
         }
+
+        tracing::info!("User {} created.", user.id);
 
         let s = server.clone();
         tokio::spawn(async move {
             if let Err(e) = request_handler(user, s, req_receiver).await {
-                eprintln!("Request handler error: {e}");
+                tracing::error!("Request handler error: {e}");
             }
         });
         if let Err(e) = websocket_loop(socket, req_sender, resp_receiver).await {
-            eprintln!("Websocket error: {e}");
+            tracing::error!("Websocket error: {e}");
         }
     })
 }
@@ -119,6 +134,7 @@ enum Role {
     Contestant { room_id: Uuid },
 }
 
+#[tracing::instrument(skip(server, receiver))]
 async fn request_handler(
     mut user: User,
     server: Server,
@@ -140,6 +156,7 @@ async fn request_handler(
                     size,
                     total,
                 };
+                tracing::info!(?response, "List rooms");
                 user.sender.send(response).await.map_err(send_error)?;
             }
             (GameRequest::EnterRoom { id }, user) => {
@@ -159,7 +176,12 @@ async fn request_handler(
                                 room_id: *ra.room.id(),
                             };
 
-                            ra.publish(GameResponse::RoomEntered).await?;
+                            let response = GameResponse::RoomEntered {
+                                contestant_id: user.id,
+                            };
+
+                            tracing::info!(?response, "Enter rooms");
+                            ra.publish(response).await?;
                         }
                     },
                     _ => {
@@ -198,28 +220,165 @@ async fn request_handler(
                         cause: Error::InvalidOperation,
                     },
                 };
+
+                tracing::info!(?response, "Create room");
                 user.sender.send(response).await.map_err(send_error)?;
             }
             (request, user) => {
                 match &user.role {
-                    Role::Contestant { room_id } | Role::Host { room_id } => {
+                    Role::Host { room_id } => match server.rooms.get_mut(room_id) {
+                        Some(mut ra) => {
+                            let room = &mut ra.room;
+                            match request {
+                                GameRequest::ExitRoom { id } => {
+                                    if id != *room.id() {
+                                        tracing::error!("exit room error: {} != {}", id, room.id())
+                                    }
+
+                                    let response = GameResponse::Exited { user_id: user.id };
+                                    tracing::info!(?response, "Host exit room");
+                                    ra.publish(response).await.map_err(send_error)?;
+                                    break;
+                                }
+                                GameRequest::UpdateSettings { settings } => {
+                                    let result = room.update_settings(settings).map(|notify| {
+                                        (GameResponse::SettingsUpdated { settings, notify }, notify)
+                                    });
+
+                                    match result {
+                                        Ok((response, notify)) => {
+                                            tracing::info!(?response, %notify, "Update settings");
+                                            if notify {
+                                                ra.publish(response).await.map_err(send_error)?;
+                                            } else {
+                                                user.sender
+                                                    .send(response)
+                                                    .await
+                                                    .map_err(send_error)?;
+                                            }
+                                        }
+                                        Err(cause) => {
+                                            user.sender
+                                                .send(GameResponse::GameError { cause })
+                                                .await
+                                                .map_err(send_error)?;
+                                        }
+                                    }
+                                }
+                                GameRequest::Start { prize } => {
+                                    let result = match prize {
+                                        Index::Random => room.start_random().map(|prize| {
+                                            (
+                                                GameResponse::Started {
+                                                    prize,
+                                                    random: true,
+                                                },
+                                                GameResponse::ContestantStarted { random: true },
+                                            )
+                                        }),
+                                        Index::Specified(prize) => room.start(prize).map(|_| {
+                                            (
+                                                GameResponse::Started {
+                                                    prize,
+                                                    random: false,
+                                                },
+                                                GameResponse::ContestantStarted { random: false },
+                                            )
+                                        }),
+                                    };
+
+                                    match result {
+                                        Ok((host_resp, contestant_resp)) => {
+                                            tracing::info!(?host_resp, ?contestant_resp, "Start");
+
+                                            ra.host.send(host_resp).await.map_err(send_error)?;
+                                            match &ra.contestant {
+                                                None => {}
+                                                Some(contestant) => {
+                                                    contestant
+                                                        .send(contestant_resp)
+                                                        .await
+                                                        .map_err(send_error)?;
+                                                }
+                                            }
+                                        }
+                                        Err(cause) => {
+                                            ra.host
+                                                .send(GameResponse::GameError { cause })
+                                                .await
+                                                .map_err(send_error)?;
+                                        }
+                                    }
+                                }
+                                GameRequest::Reveal { left } => {
+                                    let response = match left {
+                                        Index::Random => room.reveal_random().map(|left| {
+                                            GameResponse::Revealed { left, random: true }
+                                        }),
+                                        Index::Specified(left) => {
+                                            room.reveal(left).map(|_| GameResponse::Revealed {
+                                                left,
+                                                random: false,
+                                            })
+                                        }
+                                    }
+                                    .into();
+
+                                    tracing::info!(?response, "Reveal");
+                                    ra.publish(response).await.map_err(send_error)?;
+                                }
+                                GameRequest::Complete { kick_contestant } => {
+                                    let response = room
+                                        .complete(kick_contestant)
+                                        .map(|results| {
+                                            let result = GameResult::calculate(
+                                                room.settings().doors,
+                                                results,
+                                            );
+                                            GameResponse::Completed { result }
+                                        })
+                                        .into();
+                                    tracing::info!(?response, %kick_contestant, "Complete");
+                                    ra.publish(response).await.map_err(send_error)?;
+                                }
+                                _req => {}
+                            }
+                        }
+                        None => {
+                            let response = GameResponse::ServerError {
+                                cause: ServerError::RoomNotFound { id: *room_id },
+                            };
+                            user.sender.send(response).await.map_err(send_error)?;
+                        }
+                    },
+                    Role::Contestant { room_id } => {
                         match server.rooms.get_mut(room_id) {
                             Some(mut ra) => {
                                 let room = &mut ra.room;
                                 match request {
                                     GameRequest::ExitRoom { id } => {
                                         if id != *room.id() {
-                                            eprintln!("exit room error: {} != {}", id, room.id())
+                                            tracing::error!(
+                                                "exit room error: {} != {}",
+                                                id,
+                                                room.id()
+                                            )
                                         }
-                                        ra.publish(GameResponse::Exited)
-                                            .await
-                                            .map_err(send_error)?;
-                                        break;
+
+                                        // infallible
+                                        room.kick_contestant().unwrap_or_default();
+
+                                        let response = GameResponse::Exited { user_id: user.id };
+                                        tracing::info!(?response, "Contestant exit room");
+                                        ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Ready { ready } => {
                                         let response = room
                                             .contestant_ready(ready)
-                                            .map(|_| GameResponse::Ready { ready })?; // 失败了不应该返回
+                                            .map(|_| GameResponse::Ready { ready })
+                                            .into();
+
+                                        tracing::info!(?ready, "Ready");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Choose { chosen } => {
@@ -236,89 +395,17 @@ async fn request_handler(
                                                     random: false,
                                                 })
                                             }
-                                        }?;
+                                        }
+                                        .into();
+                                        tracing::info!(?response, "Choose");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Decide { decision } => {
                                         let response = room
                                             .decide(decision)
-                                            .map(|result| GameResponse::Decided { result })?;
-                                        ra.publish(response).await.map_err(send_error)?;
-                                    }
-                                    GameRequest::UpdateSettings { settings } => {
-                                        let notify = room.update_settings(settings)?;
-                                        let response =
-                                            GameResponse::SettingsUpdated { settings, notify };
-
-                                        if notify {
-                                            ra.publish(response).await.map_err(send_error)?;
-                                        } else {
-                                            user.sender.send(response).await.map_err(send_error)?;
-                                        }
-                                    }
-                                    GameRequest::Start { prize } => {
-                                        let (host_resp, contestant_resp) = match prize {
-                                            Index::Random => room.start_random().map(|prize| {
-                                                (
-                                                    GameResponse::Started {
-                                                        prize,
-                                                        random: true,
-                                                    },
-                                                    GameResponse::ContestantStarted {
-                                                        random: true,
-                                                    },
-                                                )
-                                            }),
-                                            Index::Specified(prize) => {
-                                                room.start(prize).map(|_| {
-                                                    (
-                                                        GameResponse::Started {
-                                                            prize,
-                                                            random: false,
-                                                        },
-                                                        GameResponse::ContestantStarted {
-                                                            random: false,
-                                                        },
-                                                    )
-                                                })
-                                            }
-                                        }?;
-
-                                        ra.host.send(host_resp).await.map_err(send_error)?;
-                                        match &ra.contestant {
-                                            None => {}
-                                            Some(contestant) => {
-                                                contestant
-                                                    .send(contestant_resp)
-                                                    .await
-                                                    .map_err(send_error)?;
-                                            }
-                                        }
-                                    }
-                                    GameRequest::Reveal { left } => {
-                                        let response = match left {
-                                            Index::Random => room.reveal_random().map(|left| {
-                                                GameResponse::Revealed { left, random: true }
-                                            }),
-                                            Index::Specified(left) => {
-                                                room.reveal(left).map(|_| GameResponse::Revealed {
-                                                    left,
-                                                    random: false,
-                                                })
-                                            }
-                                        }?;
-
-                                        ra.publish(response).await.map_err(send_error)?;
-                                    }
-                                    GameRequest::Complete { kick_contestant } => {
-                                        let response =
-                                            room.complete(kick_contestant).map(|results| {
-                                                let result = GameResult::calculate(
-                                                    room.settings().doors,
-                                                    results,
-                                                );
-                                                GameResponse::Completed { result }
-                                            })?;
+                                            .map(|result| GameResponse::Decided { result })
+                                            .into();
+                                        tracing::info!(?response, "Decide");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     _req => {}
@@ -328,14 +415,16 @@ async fn request_handler(
                                 let response = GameResponse::ServerError {
                                     cause: ServerError::RoomNotFound { id: *room_id },
                                 };
+                                tracing::warn!(%room_id, "Room not found");
                                 user.sender.send(response).await.map_err(send_error)?;
                             }
                         }
                     }
-                    _ => {
+                    role => {
                         let response = GameResponse::GameError {
                             cause: Error::InvalidOperation,
                         };
+                        tracing::warn!(?request, ?role, "Invalid operation");
                         user.sender.send(response).await.map_err(send_error)?;
                     }
                 }
@@ -363,21 +452,21 @@ async fn websocket_loop(
                         }
                         Message::Close(c) => match c {
                             Some(c) => {
-                                println!(
+                                tracing::info!(
                                     "Connection closed: code = {}, reason = {}",
                                     c.code, c.reason
                                 );
                                 break;
                             }
                             None => {
-                                println!("Connection closed without close frame",);
+                                tracing::info!("Connection closed without close frame",);
                                 break;
                             }
                         },
                         _ => {}
                     }
                 } else {
-                    eprintln!("Connection closed");
+                    tracing::error!("Connection closed");
                     break;
                 }
             }
@@ -387,7 +476,7 @@ async fn websocket_loop(
                         socket.send(Message::Text(serde_json::to_string(&response)?)).await?;
                     }
                     None => {
-                        eprintln!("Response channel closed");
+                        tracing::error!("Response channel closed");
                         break;
                     }
                 }
@@ -447,8 +536,12 @@ enum GameResponse {
         id: Uuid,
         settings: Settings,
     },
-    Exited,
-    RoomEntered,
+    Exited {
+        user_id: Uuid,
+    },
+    RoomEntered {
+        contestant_id: Uuid,
+    },
     SettingsUpdated {
         notify: bool,
         settings: Settings,
@@ -483,4 +576,22 @@ enum GameResponse {
     ServerError {
         cause: ServerError,
     },
+}
+
+impl From<Result<GameResponse>> for GameResponse {
+    fn from(result: Result<GameResponse>) -> Self {
+        match result {
+            Ok(response) => response,
+            Err(cause) => GameResponse::GameError { cause },
+        }
+    }
+}
+
+impl From<std::result::Result<GameResponse, ServerError>> for GameResponse {
+    fn from(result: std::result::Result<GameResponse, ServerError>) -> Self {
+        match result {
+            Ok(response) => response,
+            Err(cause) => GameResponse::ServerError { cause },
+        }
+    }
 }
