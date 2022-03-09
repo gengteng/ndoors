@@ -375,6 +375,10 @@ async fn request_handler(
                                 if matches!(room.state(), RoomState::Created) {
                                     tracing::error!(user = %user.id, room = %room_id, "User may be kicked out of room");
                                     user.role = Role::Guest;
+                                    user.sender
+                                        .send(GameResponse::Exited { user_id: user.id })
+                                        .await
+                                        .map_err(send_error)?;
                                     continue;
                                 }
                                 match request {
