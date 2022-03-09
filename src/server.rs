@@ -129,7 +129,7 @@ impl User {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum Role {
     Guest,
     Host { room_id: Uuid },
@@ -227,8 +227,8 @@ async fn request_handler(
                 user.sender.send(response).await.map_err(send_error)?;
             }
             (request, user) => {
-                match &user.role {
-                    Role::Host { room_id } => match server.rooms.get_mut(room_id) {
+                match user.role {
+                    Role::Host { room_id } => match server.rooms.get_mut(&room_id) {
                         Some(mut ra) => {
                             let room = &mut ra.room;
                             match request {
@@ -240,7 +240,9 @@ async fn request_handler(
                                     let response = GameResponse::Exited { user_id: user.id };
                                     tracing::info!(?response, "Host exit room");
                                     ra.publish(response).await.map_err(send_error)?;
-                                    break;
+                                    user.role = Role::Guest;
+                                    server.rooms.remove(&room_id);
+                                    continue;
                                 }
                                 GameRequest::UpdateSettings { settings } => {
                                     let result = room.update_settings(settings).map(|notify| {
@@ -357,7 +359,7 @@ async fn request_handler(
                         }
                         None => {
                             let response = GameResponse::ServerError {
-                                cause: ServerError::RoomNotFound { id: *room_id },
+                                cause: ServerError::RoomNotFound { id: room_id },
                             };
                             user.sender.send(response).await.map_err(send_error)?;
 
@@ -367,7 +369,7 @@ async fn request_handler(
                         }
                     },
                     Role::Contestant { room_id } => {
-                        match server.rooms.get_mut(room_id) {
+                        match server.rooms.get_mut(&room_id) {
                             Some(mut ra) => {
                                 let room = &mut ra.room;
                                 if matches!(room.state(), RoomState::Created) {
@@ -439,7 +441,7 @@ async fn request_handler(
                             }
                             None => {
                                 let response = GameResponse::ServerError {
-                                    cause: ServerError::RoomNotFound { id: *room_id },
+                                    cause: ServerError::RoomNotFound { id: room_id },
                                 };
                                 tracing::warn!(%room_id, "Room not found");
                                 user.sender.send(response).await.map_err(send_error)?;
