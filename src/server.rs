@@ -40,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
         ))
         .layer(TraceLayer::new_for_http())
         .layer(Extension(Server::default()));
+
+    tracing::info!(%addr, "Server started.");
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
@@ -134,7 +136,7 @@ enum Role {
     Contestant { room_id: Uuid },
 }
 
-#[tracing::instrument(skip(server, receiver))]
+#[tracing::instrument(skip_all, fields(user = %user.id, role = ?user.role))]
 async fn request_handler(
     mut user: User,
     server: Server,
@@ -340,8 +342,17 @@ async fn request_handler(
                                         .into();
                                     tracing::info!(?response, %kick_contestant, "Complete");
                                     ra.publish(response).await.map_err(send_error)?;
+                                    if kick_contestant {
+                                        ra.contestant = None;
+                                    }
                                 }
-                                _req => {}
+                                request => {
+                                    let response = GameResponse::GameError {
+                                        cause: Error::InvalidOperation,
+                                    };
+                                    tracing::warn!(?request, ?user.role, "Invalid operation");
+                                    user.sender.send(response).await.map_err(send_error)?;
+                                }
                             }
                         }
                         None => {
@@ -349,12 +360,21 @@ async fn request_handler(
                                 cause: ServerError::RoomNotFound { id: *room_id },
                             };
                             user.sender.send(response).await.map_err(send_error)?;
+
+                            tracing::error!(user = %user.id, "Room not found, user role changed to guest");
+                            user.role = Role::Guest;
+                            continue;
                         }
                     },
                     Role::Contestant { room_id } => {
                         match server.rooms.get_mut(room_id) {
                             Some(mut ra) => {
                                 let room = &mut ra.room;
+                                if matches!(room.state(), RoomState::Created) {
+                                    tracing::error!(user = %user.id, room = %room_id, "User may be kicked out of room");
+                                    user.role = Role::Guest;
+                                    continue;
+                                }
                                 match request {
                                     GameRequest::ExitRoom { id } => {
                                         if id != *room.id() {
@@ -408,7 +428,13 @@ async fn request_handler(
                                         tracing::info!(?response, "Decide");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
-                                    _req => {}
+                                    request => {
+                                        let response = GameResponse::GameError {
+                                            cause: Error::InvalidOperation,
+                                        };
+                                        tracing::warn!(?request, ?user.role, "Invalid operation");
+                                        user.sender.send(response).await.map_err(send_error)?;
+                                    }
                                 }
                             }
                             None => {
@@ -417,6 +443,10 @@ async fn request_handler(
                                 };
                                 tracing::warn!(%room_id, "Room not found");
                                 user.sender.send(response).await.map_err(send_error)?;
+
+                                tracing::error!(user = %user.id, "Room not found, user role changed to guest");
+                                user.role = Role::Guest;
+                                continue;
                             }
                         }
                     }
