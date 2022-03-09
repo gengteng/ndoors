@@ -22,5 +22,5 @@ name = "ndoors"
 path = "src/cli.rs"
 
 [[bin]]
-name = "server"
+name = "ndoors-server"
 path = "src/server.rs"
