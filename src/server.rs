@@ -62,20 +62,20 @@ async fn ws_handler(
             .await
             .is_err()
         {
-            tracing::error!("Failed to send UserCreated response");
+            tracing::error!("Failed to send UserCreated response.");
             return;
         }
 
-        tracing::info!("User {} created.", user.id);
+        tracing::info!(user = %user.id, "User created.");
 
         let s = server.clone();
         tokio::spawn(async move {
-            if let Err(e) = request_handler(user, s, req_receiver).await {
-                tracing::error!("Request handler error: {e}");
+            if let Err(cause) = request_handler(user, s, req_receiver).await {
+                tracing::error!(%cause, "Request handler error.");
             }
         });
-        if let Err(e) = websocket_loop(socket, req_sender, resp_receiver).await {
-            tracing::error!("Websocket error: {e}");
+        if let Err(cause) = websocket_loop(socket, req_sender, resp_receiver).await {
+            tracing::error!(%cause, "Websocket loop error.");
         }
     })
 }
@@ -102,6 +102,24 @@ struct RoomAgent {
     contestant: Option<Sender<GameResponse>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RoomInfo {
+    id: Uuid,
+    settings: Settings,
+}
+
+impl RoomInfo {
+    pub fn new(id: Uuid, settings: Settings) -> Self {
+        Self { id, settings }
+    }
+}
+
+impl From<&Room> for RoomInfo {
+    fn from(room: &Room) -> Self {
+        RoomInfo::new(*room.id(), room.settings())
+    }
+}
+
 impl RoomAgent {
     pub async fn publish(&self, response: GameResponse) -> anyhow::Result<()> {
         self.host.send(response.clone()).await.map_err(send_error)?;
@@ -110,6 +128,13 @@ impl RoomAgent {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Role {
+    Guest,
+    Host { room_id: Uuid },
+    Contestant { room_id: Uuid },
 }
 
 #[derive(Debug)]
@@ -129,11 +154,45 @@ impl User {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-enum Role {
-    Guest,
-    Host { room_id: Uuid },
-    Contestant { room_id: Uuid },
+impl Drop for User {
+    fn drop(&mut self) {
+        tracing::info!(user = %self.id, "User disconnected.");
+    }
+}
+
+#[derive(Debug)]
+struct RoomDropper {
+    rooms: Arc<DashMap<Uuid, RoomAgent>>,
+    id: Option<Uuid>,
+}
+
+impl RoomDropper {
+    pub fn new(rooms: Arc<DashMap<Uuid, RoomAgent>>) -> Self {
+        Self { rooms, id: None }
+    }
+
+    pub fn drop_manually(&mut self) {
+        if let Some(id) = self.id {
+            self.rooms.remove(&id);
+            self.id = None;
+        }
+    }
+
+    pub fn set_room(&mut self, id: Uuid) {
+        if let Some(room_id) = self.id {
+            self.rooms.remove(&room_id);
+        }
+        self.id = Some(id);
+    }
+}
+
+impl Drop for RoomDropper {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.rooms.remove(&id);
+            tracing::warn!(room = %id, "Room dropped.")
+        }
+    }
 }
 
 #[tracing::instrument(skip_all, fields(user = %user.id, role = ?user.role))]
@@ -142,6 +201,8 @@ async fn request_handler(
     server: Server,
     mut receiver: Receiver<GameRequest>,
 ) -> anyhow::Result<()> {
+    let mut room_dropper = RoomDropper::new(server.rooms.clone());
+
     while let Some(request) = receiver.recv().await {
         match (request, &mut user) {
             (GameRequest::ListRooms { page, size }, _) => {
@@ -150,7 +211,7 @@ async fn request_handler(
                     .rooms
                     .iter()
                     .skip((page * size) as usize)
-                    .map(|ra| (*ra.room.id(), ra.room.settings()))
+                    .map(|ra| RoomInfo::from(&ra.room))
                     .collect();
                 let response = GameResponse::RoomList {
                     rooms,
@@ -158,7 +219,7 @@ async fn request_handler(
                     size,
                     total,
                 };
-                tracing::info!(?response, "List rooms");
+                tracing::info!(?response, "List rooms.");
                 user.sender.send(response).await.map_err(send_error)?;
             }
             (GameRequest::EnterRoom { id }, user) => {
@@ -178,12 +239,19 @@ async fn request_handler(
                                 room_id: *ra.room.id(),
                             };
 
-                            let response = GameResponse::RoomEntered {
+                            let host_resp = GameResponse::RoomEntered {
                                 contestant_id: user.id,
                             };
 
-                            tracing::info!(?response, "Enter rooms");
-                            ra.publish(response).await?;
+                            let contestant_resp = GameResponse::ContestantRoomEntered {
+                                info: RoomInfo::from(&ra.room),
+                            };
+
+                            tracing::info!(?host_resp, "Enter rooms.");
+                            ra.host.send(host_resp).await.map_err(send_error)?;
+                            if let Some(contestant) = &ra.contestant {
+                                contestant.send(contestant_resp).await.map_err(send_error)?;
+                            }
                         }
                     },
                     _ => {
@@ -203,6 +271,9 @@ async fn request_handler(
                         };
 
                         let room = Room::create(user.id, settings);
+                        let response = GameResponse::RoomCreated {
+                            info: RoomInfo::from(&room),
+                        };
                         let room_id = *room.id();
                         user.role = Role::Host { room_id };
                         server.rooms.insert(
@@ -213,17 +284,15 @@ async fn request_handler(
                                 contestant: None,
                             },
                         );
-                        GameResponse::RoomCreated {
-                            id: room_id,
-                            settings,
-                        }
+                        room_dropper.set_room(room_id);
+                        response
                     }
                     _ => GameResponse::GameError {
                         cause: Error::InvalidOperation,
                     },
                 };
 
-                tracing::info!(?response, "Create room");
+                tracing::info!(?response, "Create room.");
                 user.sender.send(response).await.map_err(send_error)?;
             }
             (request, user) => {
@@ -234,14 +303,14 @@ async fn request_handler(
                             match request {
                                 GameRequest::ExitRoom { id } => {
                                     if id != *room.id() {
-                                        tracing::error!("exit room error: {} != {}", id, room.id())
+                                        tracing::error!("exit room error: {} != {}.", id, room.id())
                                     }
 
                                     let response = GameResponse::Exited { user_id: user.id };
-                                    tracing::info!(?response, "Host exit room");
+                                    tracing::info!(?response, "Host exit room.");
                                     ra.publish(response).await.map_err(send_error)?;
                                     user.role = Role::Guest;
-                                    server.rooms.remove(&room_id);
+                                    room_dropper.drop_manually();
                                     continue;
                                 }
                                 GameRequest::UpdateSettings { settings } => {
@@ -251,7 +320,7 @@ async fn request_handler(
 
                                     match result {
                                         Ok((response, notify)) => {
-                                            tracing::info!(?response, %notify, "Update settings");
+                                            tracing::info!(?response, %notify, "Update settings.");
                                             if notify {
                                                 ra.publish(response).await.map_err(send_error)?;
                                             } else {
@@ -293,7 +362,7 @@ async fn request_handler(
 
                                     match result {
                                         Ok((host_resp, contestant_resp)) => {
-                                            tracing::info!(?host_resp, ?contestant_resp, "Start");
+                                            tracing::info!(?host_resp, ?contestant_resp, "Start.");
 
                                             ra.host.send(host_resp).await.map_err(send_error)?;
                                             match &ra.contestant {
@@ -328,7 +397,7 @@ async fn request_handler(
                                     }
                                     .into();
 
-                                    tracing::info!(?response, "Reveal");
+                                    tracing::info!(?response, "Reveal.");
                                     ra.publish(response).await.map_err(send_error)?;
                                 }
                                 GameRequest::Complete { kick_contestant } => {
@@ -342,7 +411,7 @@ async fn request_handler(
                                             GameResponse::Completed { result }
                                         })
                                         .into();
-                                    tracing::info!(?response, %kick_contestant, "Complete");
+                                    tracing::info!(?response, %kick_contestant, "Complete.");
                                     ra.publish(response).await.map_err(send_error)?;
                                     if kick_contestant {
                                         ra.contestant = None;
@@ -352,7 +421,7 @@ async fn request_handler(
                                     let response = GameResponse::GameError {
                                         cause: Error::InvalidOperation,
                                     };
-                                    tracing::warn!(?request, ?user.role, "Invalid operation");
+                                    tracing::warn!(?request, ?user.role, "Invalid operation.");
                                     user.sender.send(response).await.map_err(send_error)?;
                                 }
                             }
@@ -363,7 +432,7 @@ async fn request_handler(
                             };
                             user.sender.send(response).await.map_err(send_error)?;
 
-                            tracing::error!(user = %user.id, "Room not found, user role changed to guest");
+                            tracing::error!(user = %user.id, "Room not found, user role changed to guest.");
                             user.role = Role::Guest;
                             continue;
                         }
@@ -373,7 +442,7 @@ async fn request_handler(
                             Some(mut ra) => {
                                 let room = &mut ra.room;
                                 if matches!(room.state(), RoomState::Created) {
-                                    tracing::error!(user = %user.id, room = %room_id, "User may be kicked out of room");
+                                    tracing::error!(user = %user.id, room = %room_id, "User may be kicked out of room.");
                                     user.role = Role::Guest;
                                     user.sender
                                         .send(GameResponse::Exited { user_id: user.id })
@@ -385,7 +454,7 @@ async fn request_handler(
                                     GameRequest::ExitRoom { id } => {
                                         if id != *room.id() {
                                             tracing::error!(
-                                                "exit room error: {} != {}",
+                                                "exit room error: {} != {}.",
                                                 id,
                                                 room.id()
                                             )
@@ -395,7 +464,7 @@ async fn request_handler(
                                         room.kick_contestant().unwrap_or_default();
 
                                         let response = GameResponse::Exited { user_id: user.id };
-                                        tracing::info!(?response, "Contestant exit room");
+                                        tracing::info!(?response, "Contestant exit room.");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Ready { ready } => {
@@ -404,7 +473,7 @@ async fn request_handler(
                                             .map(|_| GameResponse::Ready { ready })
                                             .into();
 
-                                        tracing::info!(?ready, "Ready");
+                                        tracing::info!(?ready, "Ready.");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Choose { chosen } => {
@@ -423,7 +492,7 @@ async fn request_handler(
                                             }
                                         }
                                         .into();
-                                        tracing::info!(?response, "Choose");
+                                        tracing::info!(?response, "Choose.");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     GameRequest::Decide { decision } => {
@@ -431,14 +500,14 @@ async fn request_handler(
                                             .decide(decision)
                                             .map(|result| GameResponse::Decided { result })
                                             .into();
-                                        tracing::info!(?response, "Decide");
+                                        tracing::info!(?response, "Decide.");
                                         ra.publish(response).await.map_err(send_error)?;
                                     }
                                     request => {
                                         let response = GameResponse::GameError {
                                             cause: Error::InvalidOperation,
                                         };
-                                        tracing::warn!(?request, ?user.role, "Invalid operation");
+                                        tracing::warn!(?request, ?user.role, "Invalid operation.");
                                         user.sender.send(response).await.map_err(send_error)?;
                                     }
                                 }
@@ -447,10 +516,10 @@ async fn request_handler(
                                 let response = GameResponse::ServerError {
                                     cause: ServerError::RoomNotFound { id: room_id },
                                 };
-                                tracing::warn!(%room_id, "Room not found");
+                                tracing::warn!(%room_id, "Room not found.");
                                 user.sender.send(response).await.map_err(send_error)?;
 
-                                tracing::error!(user = %user.id, "Room not found, user role changed to guest");
+                                tracing::error!(user = %user.id, "Room not found, user role changed to guest.");
                                 user.role = Role::Guest;
                                 continue;
                             }
@@ -460,7 +529,7 @@ async fn request_handler(
                         let response = GameResponse::GameError {
                             cause: Error::InvalidOperation,
                         };
-                        tracing::warn!(?request, ?role, "Invalid operation");
+                        tracing::warn!(?request, ?role, "Invalid operation.");
                         user.sender.send(response).await.map_err(send_error)?;
                     }
                 }
@@ -489,20 +558,20 @@ async fn websocket_loop(
                         Message::Close(c) => match c {
                             Some(c) => {
                                 tracing::info!(
-                                    "Connection closed: code = {}, reason = {}",
+                                    "Connection closed: code = {}, reason = {}.",
                                     c.code, c.reason
                                 );
                                 break;
                             }
                             None => {
-                                tracing::info!("Connection closed without close frame",);
+                                tracing::info!("Connection closed without close frame.",);
                                 break;
                             }
                         },
                         _ => {}
                     }
                 } else {
-                    tracing::error!("Connection closed");
+                    tracing::error!("Connection closed.");
                     break;
                 }
             }
@@ -512,7 +581,7 @@ async fn websocket_loop(
                         socket.send(Message::Text(serde_json::to_string(&response)?)).await?;
                     }
                     None => {
-                        tracing::error!("Response channel closed");
+                        tracing::error!("Response channel closed.");
                         break;
                     }
                 }
@@ -563,20 +632,22 @@ enum GameResponse {
         id: Uuid,
     },
     RoomList {
-        rooms: Vec<(Uuid, Settings)>,
+        rooms: Vec<RoomInfo>,
         page: u32,
         size: u32,
         total: u32,
     },
     RoomCreated {
-        id: Uuid,
-        settings: Settings,
+        info: RoomInfo,
     },
     Exited {
         user_id: Uuid,
     },
     RoomEntered {
         contestant_id: Uuid,
+    },
+    ContestantRoomEntered {
+        info: RoomInfo,
     },
     SettingsUpdated {
         notify: bool,
